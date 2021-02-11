@@ -1,0 +1,1277 @@
+---
+title: "Adaptive Algorithms"
+author: '13008341'
+header-includes:
+  - \usepackage[]{algorithm2e}
+date: "13/07/2020"
+output: pdf_document
+fontsize: 11
+geometry: margin=1in
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(mvtnorm)
+library(coda)
+library(ggplot2)
+library(gridExtra)
+library(wrswoR)
+library(ellipse)
+library(gganimate)
+library(gifski)
+library(av)
+library(reshape2)
+library(scales)
+library(devtools)
+library(ggallin)
+library(Rcpp)
+library(RcppArmadillo)
+sourceCpp("/Users/maxharwoodhird/Documents/PhD/Barker/logistic_helpers.cpp")
+```
+
+```{r}
+adapt <- function(init,
+                  sample,
+                  update,
+                  logpi,
+                  logpi_args,
+                  seed = 2000,
+                  learn_in,
+                  nits = 5000,
+                  gamma,
+                  stop_after,
+                  m = 2,
+                  optimal_a) {
+  # Constructs a chain using an adaptive MCMC algorithm.
+  # init: initial state and parameter values
+  # sample: function for the sample step
+  # update: function for the update step
+  # logpi: logarithm of the posterior density
+  # logpi_args: list of named arguments for the logpi function
+  # seed: hold constant for replicatable results
+  # learn_in: period in which only sample step is applied
+  # nits: number of iterations to run for (including the learn in)
+  # gamma: a function which returns the next value of gamma
+  # stop_after: number of iterations to stop adapting after
+  # m: the number of eigenvectors estimated in the PCA update
+  # optimal_a: the optimal acceptance rate
+  
+  # Timing
+  start_time <- Sys.time()
+  
+  # set the seed
+  set.seed(seed)
+  
+  # initial values
+  x_curr <- init[['X']]
+  p_curr <- init[['params']]
+  gamma_curr <- init[['gamma']]
+  
+  # get the dimension, and number of weights (for localised RWM)
+  dim <- length(x_curr)
+  if (sample == 'Local_RWM_sample') {
+    k_max <- nrow(p_curr[['mus']])
+  }
+  
+  if (sample != "AM_GAS_MALA_sample") {
+    # the initial value of logpi can be sampled if the proposal
+    # is not MALA
+    # arg_name <- formalArgs(logpi)[1]
+    # logpi_args[[arg_name]] <- x_curr
+    # 
+    # logpi_curr <- do.call(logpi, logpi_args)
+    logpi_curr <- logpi_logistic_cpp(beta = x_curr,
+                                     X = as.matrix(logpi_args[['X']]),
+                                     Y = logpi_args[['Y']],
+                                     prior_variance = logpi_args[['prior_variance']])
+  }
+  
+  # store whether a point has been accepted
+  accepteds <- vector(length = nits)
+  # store the chain
+  x_store <- matrix(nrow = nits, ncol = dim)
+  # store the acceptance probabilities
+  acceptances <- vector(length = nits)
+  # store the "raw" densities i.e. where the acceptance probabilities
+  # above are all in the form min(1, a), store a.
+  raw_acceptances <- vector(length = nits)
+  
+  
+  # make a place to store the mus, sigmas, and 'acceptedness'
+  if (sample == 'Local_RWM_sample') {
+    mus <- matrix(nrow = nits * k_max, ncol = dim)
+    sigmas <- matrix(nrow = nits * dim * k_max, ncol = dim)
+  } else {
+    mus <- matrix(nrow = nits, ncol = dim)
+    sigmas <- matrix(nrow = nits * dim, ncol = dim)
+  }
+  as <- matrix(nrow = nits, ncol = 1)
+  
+  # make a place to store the eigenvectors if using a PCA update
+  if (sample == 'PCA_sample') {
+    e_vectors <- matrix(nrow = nits * m, ncol = dim)
+  } else {
+    e_vectors <- matrix(nrow = 0, ncol = 1)
+  }
+  # make a place to store the weights if using local RWM
+  if (sample == 'Local_RWM_sample') {
+    weights <- matrix(nrow = nits, ncol = k_max)
+  } else {
+    weights <- matrix(nrow = 0, ncol = 1)
+  }
+  # make a place to store the lambdas if using CAM-CAS
+  if (sample == 'CAM_CAS_sample') {
+    lambdas <- matrix(nrow = nits, ncol = length(p_curr[['lambdas']]))
+  } else if (sample == 'AM_GAS_sample') {
+    lambdas <- matrix(nrow = nits, ncol = 1)
+  } else {
+    lambdas <- matrix(nrow = 0, ncol = 1)
+  }
+  # make a place to store the scale and gradient info if using AM-GAS
+  # with the Barker Proposal or the MALA proposal
+  if (sample == 'AM_GAS_Barker_sample' || sample == 'AM_GAS_MALA_sample') {
+    scales <- vector(length = nits)
+    gradients <- matrix(nrow = nits, ncol = length(x_curr))
+  } else {
+    scales <- vector(length = 1)
+    gradients <- matrix(nrow = 0, ncol = 1)
+  }
+  
+  # make a place to store the scale if using AM-Gas
+  if (sample == "AM_GAS_diag_sample") {
+    scales <- vector(length = nits)
+  } else {
+    scales <- vector(length = 1)
+  }
+  for (i in 1:nits) {
+    # sample step
+    if (sample == "AM_sample") {
+      samp <- AM_sample(x_curr = x_curr,
+                        logpi = logpi,
+                        logpi_args = logpi_args,
+                        logpi_curr = logpi_curr,
+                        p_curr = p_curr)
+    } else if (sample == "CAM_CAS_sample") {
+        samp <- CAM_CAS_sample(x_curr = x_curr,
+                               logpi = logpi,
+                               logpi_args = logpi_args,
+                               logpi_curr = logpi_curr,
+                               p_curr = p_curr)
+        
+        p_curr[['loga']] <- samp[['loga']]
+        p_curr[['k']] <- samp[['k']]
+        
+    } else if (sample == "GAM_CAS_sample") {
+        samp <- GAM_CAS_sample(x_curr = x_curr,
+                               logpi = logpi,
+                               logpi_args = logpi_args,
+                               logpi_curr = logpi_curr,
+                               p_curr = p_curr)
+        
+        p_curr[['old_x']] <- samp[['old_x']]
+        p_curr[['z']] <- samp[['z']]
+        p_curr[['old_logpi']] <- samp[['old_logpi']]
+        
+    } else if (sample == "Local_RWM_sample") {
+        samp <- Local_RWM_sample(x_curr = x_curr,
+                                 logpi = logpi,
+                                 logpi_args = logpi_args,
+                                 logpi_curr,
+                                 p_curr)
+        
+        p_curr[['z']] <- samp[['z']]
+        p_curr[['densities']] <- samp[['densities']]
+        p_curr[['loga']] <- samp[['loga']]
+        
+    } else if (sample == 'PCA_sample') {
+        samp <- PCA_sample(x_curr,
+                           logpi,
+                           logpi_args,
+                           logpi_curr,
+                           p_curr)
+        p_curr[['direction_number']] <- samp[['direction_number']]
+        p_curr[['loga']] <- samp[['loga']]
+    } else if (sample == "AM_GAS_sample") {
+      samp <- AM_GAS_sample(x_curr,
+                            logpi,
+                            logpi_args,
+                            logpi_curr,
+                            p_curr)
+      p_curr[['loga']] <- samp[['loga']]
+    } else if (sample == "LPM_RWM_sample") {
+      samp <- LPM_RWM_sample(x_curr = x_curr,
+                        logpi = logpi,
+                        logpi_args = logpi_args,
+                        logpi_curr = logpi_curr,
+                        p_curr = p_curr)
+    } else if (sample == "AM_GAS_Barker_sample") {
+      samp <- AM_GAS_Barker_sample(x_curr = x_curr,
+                            logpi = logpi,
+                            logpi_args = logpi_args,
+                            p_curr = p_curr)
+      p_curr[['grad_log_pi']] <- samp[['grad_log_pi']]
+      p_curr[['loga']] <- samp[['loga']]
+    } else if (sample == "AM_GAS_diag_sample") {
+      samp <- AM_GAS_diag_sample(x_curr,
+                                 logpi,
+                                 logpi_args,
+                                 logpi_curr,
+                                 p_curr)
+      p_curr[['loga']] <- samp[['loga']]
+    } else if (sample == "AM_GAS_MALA_sample") {
+      samp <- AM_GAS_MALA_sample(x_curr = x_curr,
+                                 logpi = logpi,
+                                 logpi_args = logpi_args,
+                                 p_curr = p_curr)
+      
+      p_curr[['grad_log_pi']] <- samp[['grad_log_pi']]
+      p_curr[['loga']] <- samp[['loga']]
+    }
+    
+    x_temp <- as.vector(samp[['x']])
+    logpi_curr <- samp[['logpi']]
+    
+    # store whether the proposed point was accepted or not
+    if (isTRUE(all.equal(x_temp, x_curr))) {
+      accepteds[i] <- 0
+    } else {
+      accepteds[i] <- 1
+    }
+    x_curr <- x_temp
+    
+    # store the acceptance probability
+    acceptances[i] <- min(1, exp(p_curr[['loga']]))
+    
+    # store the raw density
+    raw_acceptances[i] <- exp(p_curr[['loga']])
+    
+    # store the state, the acceptedness, and the parameters used to sample
+    # the state
+    x_store[i, ] <- x_curr
+    if (sample == 'Local_RWM_sample') {
+      # for local RWM there are k_max means and k_max sigmas etc.
+      # you don't actually need the loop, since p_curr[['mus']] is a matrix
+      for (s in 1:k_max) {
+        mus[k_max * (i - 1) + s, ] <- p_curr[['mus']][s, ]
+      }
+      sigmas[(dim * k_max * (i - 1) + 1):(dim * k_max * i), ] <- p_curr[['sigmas']]
+    } else {
+      mus[i, ] <- p_curr[['mu']]
+      as[i, 1] <- matrix(as.numeric(x_temp == x_curr), nrow = 1, ncol = 1)
+      
+      # sigmas[(dim * (i - 1) + 1):(i * dim), ] <- p_curr[['sigma']]
+      # collect only the diagonal elements so as not to exhaust the RAM
+      sigmas[(dim * (i - 1) + 1):(i * dim), ] <- diag(diag(p_curr[['sigma']]))
+    }
+    
+    # store the eigenvectors if using the PCA update
+    if (sample == 'PCA_sample') {
+      e_vectors[(m * (i - 1) + 1):(m * i), ] <- p_curr[['e_vectors']]
+    }
+    # store the weights if using local RWM
+    if (sample == 'Local_RWM_sample') {
+      weights[i, ] <- p_curr[['weights']]
+    }
+    # store the lambdas if using CAM_CAS
+    if (sample == 'CAM_CAS_sample') {
+      lambdas[i, ] <- p_curr[['lambdas']]
+    }
+    # store the scale if using AM_GAS
+    if (sample == 'AM_GAS_sample') {
+      lambdas[i, ] <- p_curr[['scale']]
+    }
+    
+    if (sample == 'AM_GAS_Barker_sample' || sample == 'AM_GAS_MALA_sample') {
+      scales[i] <- p_curr[['scale']]
+      gradients[i, ] <- p_curr[['grad_log_pi']]
+    }
+    
+    if (sample == "AM_GAS_diag_sample") {
+      scales[i] <- p_curr[['scale']]
+    }
+    
+    if (i > learn_in) {
+      # adaptive step
+      gamma_curr <- gamma(current = gamma_curr,
+                          iteration = i)
+      if (update == "AM_update") {
+        if (i == learn_in + 1 && learn_in != 0) {
+        # use empirical covar. and mean from initial sample:
+        p_curr[['mu']] <- vector(mode = "numeric", length = dim)
+        for (j in 1:dim) {
+          p_curr[['mu']][j] <- mean(x_store[, j], na.rm = TRUE)
+        }
+        
+        # scale sigma appropriately and perturb slightly to avoid singularity:
+        scale <- 2.4 ^ 2 / dim
+        epsilon <- 0.001
+        p_curr[['sigma']] <- scale * (cov(x_store[1:i, ]) + epsilon * diag(dim))
+        }
+        p_curr <- AM_update(x_curr = x_curr,
+                            p_curr = p_curr,
+                            gamma_curr = gamma_curr)
+      } else if (update == "CAM_CAS_update") {
+        if (i == learn_in + 1 && learn_in != 0) {
+        # use empirical covar. and mean from initial sample:
+        p_curr[['mu']] <- vector(mode = "numeric", length = dim)
+        for (j in 1:dim) {
+          p_curr[['mu']][j] <- mean(x_store[, j], na.rm = TRUE)
+        }
+        
+        # scale sigma appropriately and perturb slightly to avoid singularity:
+        scale <- 2.4 ^ 2 / dim
+        epsilon <- 0.001
+        p_curr[['sigma']] <- scale * (cov(x_store[1:i, ]) + epsilon * diag(dim))
+        }
+        p_curr <- CAM_CAS_update(x_curr = x_curr,
+                                 p_curr = p_curr,
+                                 loga_curr = p_curr[['loga']],
+                                 optimal_a = optimal_a,
+                                 k_curr = p_curr[['k']],
+                                 gamma_curr = gamma_curr)
+      } else if (update == "GAM_CAS_update") {
+        if (i == learn_in + 1 && learn_in != 0) {
+        # use empirical covar. and mean from initial sample:
+        p_curr[['mu']] <- vector(mode = "numeric", length = dim)
+        for (j in 1:dim) {
+          p_curr[['mu']][j] <- mean(x_store[, j], na.rm = TRUE)
+        }
+        
+        # scale sigma appropriately and perturb slightly to avoid singularity:
+        scale <- 2.4 ^ 2 / dim
+        epsilon <- 0.001
+        p_curr[['sigma']] <- scale * (cov(x_store[1:i, ]) + epsilon * diag(dim))
+        }
+        p_curr <- GAM_CAS_update(x_curr = x_curr,
+                                 p_curr = p_curr,
+                                 optimal_a = optimal_a,
+                                 gamma_curr = gamma_curr,
+                                 logpi = logpi,
+                                 logpi_args = logpi_args)
+      } else if (update == "Local_RWM_update") {
+        p_curr <- Local_RWM_update(x_curr = x_curr,
+                                   p_curr = p_curr,
+                                   optimal_a = optimal_a,
+                                   gamma_curr = gamma_curr)
+      } else if (update == 'PCA_update') {
+        if (i == learn_in + 1 && learn_in != 0) {
+          # use empirical covar. and mean from initial sample:
+          p_curr[['mu']] <- vector(mode = "numeric", length = dim)
+          for (j in 1:dim) {
+            p_curr[['mu']][j] <- mean(x_store[, j], na.rm = TRUE)
+          }
+          
+          # scale sigma appropriately and perturb slightly to avoid singularity:
+          scale <- 2.4 ^ 2 / dim
+          epsilon <- 0.001
+          p_curr[['sigma']] <- scale * (cov(x_store[1:i, ]) + epsilon * diag(dim))
+        }
+        p_curr <- PCA_update(x_curr = x_curr,
+                             p_curr = p_curr,
+                             optimal_a = optimal_a,
+                             gamma_curr = gamma_curr)
+      } else if (update == "AM_GAS_update") {
+        if (i == learn_in + 1 && learn_in != 0) {
+          # use empirical covar. and mean from initial sample:
+          p_curr[['mu']] <- vector(mode = "numeric", length = dim)
+          for (j in 1:dim) {
+            p_curr[['mu']][j] <- mean(x_store[, j], na.rm = TRUE)
+          }
+          
+          # scale sigma appropriately and perturb slightly to avoid singularity:
+          scale <- 2.4 ^ 2 / dim
+          epsilon <- 0.001
+          p_curr[['sigma']] <- scale * (cov(x_store[1:i, ]) + epsilon * diag(dim))
+        }
+        p_curr <- AM_GAS_update(x_curr = x_curr,
+                                p_curr = p_curr,
+                                optimal_a = optimal_a,
+                                gamma_curr = gamma_curr)
+      } else if (update == "AM_GAS_Barker_update") {
+        if (i == learn_in + 1 && learn_in != 0) {
+          # use empirical covar. and mean from initial sample:
+          p_curr[['mu']] <- vector(mode = "numeric", length = dim)
+          for (j in 1:dim) {
+            p_curr[['mu']][j] <- mean(x_store[, j], na.rm = TRUE)
+          }
+          
+          # scale sigma appropriately and perturb slightly to avoid singularity:
+          scale <- 2.4 ^ 2 / dim
+          epsilon <- 0.001
+          p_curr[['sigma']] <- scale * (cov(x_store[1:i, ]) + epsilon * diag(dim))
+        }
+        p_curr <- AM_GAS_Barker_update(x_curr = x_curr,
+                                       p_curr = p_curr,
+                                       optimal_a = optimal_a,
+                                       gamma_curr = gamma_curr)
+      } else if (update == "AM_GAS_diag_update") {
+        if (i == learn_in + 1 && learn_in != 0) {
+          # use empirical covar. and mean from initial sample:
+          p_curr[['mu']] <- vector(mode = "numeric", length = dim)
+          for (j in 1:dim) {
+            p_curr[['mu']][j] <- mean(x_store[, j], na.rm = TRUE)
+          }
+          
+          # scale sigma appropriately and perturb slightly to avoid singularity:
+          scale <- 2.4 ^ 2 / dim
+          epsilon <- 0.001
+          p_curr[['sigma']] <- scale * (cov(x_store[1:i, ]) + epsilon * diag(dim))
+        }
+        p_curr <- AM_GAS_diag_update(x_curr = x_curr,
+                                     p_curr = p_curr,
+                                     optimal_a = optimal_a,
+                                     gamma_curr = gamma_curr)
+      } else if (update == "AM_GAS_MALA_update") {
+        if (i == learn_in + 1 && learn_in != 0) {
+          # use empirical covar. and mean from initial sample:
+          p_curr[['mu']] <- vector(mode = "numeric", length = dim)
+          for (j in 1:dim) {
+            p_curr[['mu']][j] <- mean(x_store[, j], na.rm = TRUE)
+          }
+          
+          # scale sigma appropriately and perturb slightly to avoid singularity:
+          scale <- 2.4 ^ 2 / dim
+          epsilon <- 0.001
+          p_curr[['sigma']] <- scale * (cov(x_store[1:i, ]) + epsilon * diag(dim))
+        }
+        p_curr <- AM_GAS_MALA_update(x_curr = x_curr,
+                                     p_curr = p_curr,
+                                     optimal_a = optimal_a,
+                                     gamma_curr = gamma_curr)
+      }
+    }
+  }
+  # Timing
+  end_time <- Sys.time()
+  return(list(x_store = x_store,
+              mus = mus,
+              as = as,
+              sigmas = sigmas,
+              e_vectors = e_vectors,
+              weights = weights,
+              lambdas = lambdas,
+              time = end_time - start_time,
+              scales = scales,
+              gradients = gradients,
+              accepteds = accepteds,
+              acceptances = acceptances,
+              raw_acceptances = raw_acceptances))
+}
+```
+
+```{r}
+AM_GAS_sample <- function(x_curr,
+                          logpi,
+                          logpi_args,
+                          logpi_curr,
+                          p_curr) {
+  scale <- p_curr[['scale']]
+  sigma <- p_curr[['sigma']]
+  
+  x_prop <- rmvnorm(1, mean = x_curr, sigma = scale * sigma)
+  
+  # loga_list <- loga(logpi = logpi,
+  #              logpi_args = logpi_args,
+  #              x_prop = x_prop,
+  #              logpi_curr = logpi_curr)
+  # loga <- loga_list[['loga']]
+  # logpi_prop <- loga_list[['logpi_prop']]
+  logpi_prop <- logpi_logistic_cpp(beta = x_prop,
+                                   X = as.matrix(logpi_args[['X']]),
+                                   Y = logpi_args[['Y']],
+                                   prior_variance = logpi_args[['prior_variance']])
+  loga <- logpi_prop - logpi_curr
+  u <- runif(1)
+    
+  if (log(u) < loga) {
+    return(list(x = x_prop,
+                logpi = logpi_prop,
+                loga = loga))
+  } else {
+    return(list(x = x_curr,
+                logpi = logpi_curr,
+                loga = loga))
+  }
+}
+```
+
+
+```{r}
+AM_GAS_update <- function(x_curr,
+                          p_curr,
+                          optimal_a,
+                          gamma_curr) {
+  mu_new <- p_curr[['mu']] + gamma_curr * (x_curr - p_curr[['mu']])
+  
+  sig_step <- outer_prod(x_curr - p_curr[['mu']], x_curr - p_curr[['mu']])
+  sig_new <- p_curr[['sigma']] + gamma_curr * (sig_step - p_curr[['sigma']])
+  # comment the above line, and uncomment the below (or vice-versa) to switch between purely diagonal covariances
+  # and dense covariances
+  # sig_new <- diag(diag(p_curr[['sigma']] + gamma_curr * (sig_step - p_curr[['sigma']])))
+  
+  scale_new <- exp(log(p_curr[['scale']]) + gamma_curr * (min(1, exp(p_curr[['loga']])) - optimal_a))
+  
+  return(list(mu = mu_new,
+              sigma = sig_new,
+              scale = scale_new))
+}
+```
+
+```{r}
+AM_GAS_Barker_sample <- function(x_curr,
+                                 logpi,
+                                 logpi_args,
+                                 p_curr) {
+  scale <- p_curr[['scale']]
+  sigma <- p_curr[['sigma']]
+  grad_log_pi <- p_curr[['grad_log_pi']]
+  
+  d <- length(x_curr)
+  
+  # Barker Sample. Notation is as in "The Barker proposal: combining robustness
+  # and efficiency in gradient-based MCMC" by Livingstone and Zanella (2020)
+  z_prop <- rmvnorm(1, mean = rep(0, length(x_curr)), sigma = scale * sigma)
+  y <- vector(length = length(x_curr))
+  for (i in 1:length(x_curr)){
+    z_i <- z_prop[i]
+    p_x_z_i <- (1 + exp(-z_i * grad_log_pi[i])) ^ -1
+    
+    if (runif(1) < p_x_z_i) {
+      b_x_z_i <- 1
+    } else {
+      b_x_z_i <- -1
+    }
+    y[i] <- x_curr[i] + b_x_z_i * z_i
+  }
+  # calculate the grad of the proposed point
+  # grad_log_pi_y <- grad_log(y, logpi_args)
+  # 
+  # loga <- logpi_diag(X = y, mu = logpi_args[['mu']], sigma = logpi_args[['sigma']])
+  # loga <- loga - logpi_diag(X = x_curr, mu = logpi_args[['mu']], sigma = logpi_args[['sigma']])
+  grad_log_pi_y <- grad_log_pi_logistic_cpp(x = y,
+                                            X = as.matrix(logpi_args[['X']]),
+                                            Y = logpi_args[['Y']],
+                                            prior_variance = logpi_args[['prior_variance']])
+  
+  loga <- logpi_logistic_cpp(beta = y,
+                             X = as.matrix(logpi_args[['X']]),
+                             Y = logpi_args[['Y']],
+                             prior_variance = logpi_args[['prior_variance']])
+  loga <- loga - logpi_logistic_cpp(beta = x_curr,
+                                    X = as.matrix(logpi_args[['X']]),
+                                    Y = logpi_args[['Y']],
+                                    prior_variance = logpi_args[['prior_variance']])
+  
+  
+  # for (i in 1:length(x_curr)) {
+  #   loga <- loga + log(1 + exp((x_curr[i] - y[i]) * grad_log_pi[i])) - log(1 + exp((y[i] - x_curr[i]) * grad_log_pi_y[i]))
+  # }
+  # use the log-sum-exp trick for numerical stability
+  beta1 <- c(-grad_log_pi_y * (x_curr - y))
+  beta2 <- c(-grad_log_pi * (y - x_curr))
+  
+  loga <- loga + sum(-(pmax(beta1, 0) + log1p(exp(-abs(beta1)))) + (pmax(beta2, 0) + log1p(exp(-abs(beta2)))))
+
+  u <- runif(1)
+  
+  if (log(u) < loga) {
+    return(list(x = y,
+                logpi = FALSE,
+                loga = loga,
+                grad_log_pi = grad_log_pi_y))
+  } else {
+    return(list(x = x_curr,
+                logpi = FALSE,
+                loga = loga,
+                grad_log_pi = grad_log_pi))
+  }
+}
+```
+
+```{r}
+AM_GAS_Barker_update <- function(x_curr,
+                                 p_curr,
+                                 optimal_a,
+                                 gamma_curr) {
+  mu_new <- p_curr[['mu']] + gamma_curr * (x_curr - p_curr[['mu']])
+  
+  sig_step <- outer_prod(x_curr - p_curr[['mu']], x_curr - p_curr[['mu']])
+  
+  sig_new <- p_curr[['sigma']] + gamma_curr * (sig_step - p_curr[['sigma']])
+  # comment the above line, and uncomment the below (or vice-versa) to switch between purely diagonal covariances
+  # and dense covariances
+  # sig_new <- diag(diag(p_curr[['sigma']] + gamma_curr * (sig_step - p_curr[['sigma']])))
+  
+  scale_new <- exp(log(p_curr[['scale']]) + gamma_curr * (min(1, exp(p_curr[['loga']])) - optimal_a))
+  
+  return(list(mu = mu_new,
+              sigma = sig_new,
+              scale = scale_new,
+              grad_log_pi = p_curr[['grad_log_pi']]))
+}
+```
+
+```{r}
+AM_GAS_MALA_sample <- function(x_curr,
+                               logpi,
+                               logpi_args,
+                               p_curr){
+  scale <- p_curr[['scale']]
+  adaptive_sigma <- p_curr[['sigma']]
+  grad_log_pi_curr <- p_curr[['grad_log_pi']]
+  
+  # propose the new point according to MALA dynamics:
+  x_prop <- rmvnorm(n = 1,
+                    mean = x_curr + as.vector((scale / 2) * adaptive_sigma %*% grad_log_pi_curr),
+                    sigma = scale * adaptive_sigma)
+  
+  # get the gradient of the proposed point
+  # grad_log_pi_x_prop <- grad_log(x_prop, logpi_args)
+  grad_log_pi_x_prop <- grad_log_pi_logistic_cpp(x = x_prop,
+                                                 X = as.matrix(logpi_args[['X']]),
+                                                 Y = logpi_args[['Y']],
+                                                 prior_variance = logpi_args[['prior_variance']])
+  
+  # get the log(acceptance)
+  # loga <- logpi_MALA(Y = x_prop,
+  #                    X = x_curr,
+  #                    mu = logpi_args[['mu']],
+  #                    sigma = logpi_args[['sigma']],
+  #                    adaptive_sigma = adaptive_sigma,
+  #                    grad_log_pi_Y = grad_log_pi_x_prop,
+  #                    scale = scale)
+  # loga <- loga - logpi_MALA(Y = x_curr,
+  #                    X = x_prop,
+  #                    mu = logpi_args[['mu']],
+  #                    sigma = logpi_args[['sigma']],
+  #                    adaptive_sigma = adaptive_sigma,
+  #                    grad_log_pi_Y = grad_log_pi_curr,
+  #                    scale = scale)
+  loga <- logpi_MALA_logistic_cpp(beta_old = x_curr,
+                              beta_new = x_prop,
+                              X = as.matrix(logpi_args[['X']]),
+                              Y = logpi_args[['Y']],
+                              prior_variance = logpi_args[['prior_variance']],
+                              adaptive_sigma = adaptive_sigma,
+                              scale = scale,
+                              grad_log_pi_beta_new = grad_log_pi_x_prop)
+  loga <- loga - logpi_MALA_logistic_cpp(beta_old = x_prop,
+                                     beta_new = x_curr,
+                                     X = as.matrix(logpi_args[['X']]),
+                                     Y = logpi_args[['Y']],
+                                     prior_variance = logpi_args[['prior_variance']],
+                                     adaptive_sigma = adaptive_sigma,
+                                     scale = scale,
+                                     grad_log_pi_beta_new = grad_log_pi_curr)
+  
+  u <- runif(1)
+  if(u < min(1, exp(loga))) {
+    return(list(grad_log_pi = grad_log_pi_x_prop,
+                loga = loga,
+                x = x_prop,
+                logpi = FALSE))
+  } else {
+    return(list(grad_log_pi = grad_log_pi_curr,
+                loga = loga,
+                x = x_curr,
+                logpi = FALSE))
+  }
+}
+```
+
+```{r}
+AM_GAS_MALA_update <- function(x_curr,
+                               p_curr,
+                               optimal_a,
+                               gamma_curr) {
+  mu_new <- p_curr[['mu']] + gamma_curr * (x_curr - p_curr[['mu']])
+  
+  sig_step <- outer_prod(x_curr - p_curr[['mu']], x_curr - p_curr[['mu']])
+  sig_new <- p_curr[['sigma']] + gamma_curr * (sig_step - p_curr[['sigma']])
+  # comment the above line, and uncomment the below (or vice-versa) to switch between purely diagonal covariances
+  # and dense covariances
+  # sig_new <- diag(diag(p_curr[['sigma']] + gamma_curr * (sig_step - p_curr[['sigma']])))
+  
+  # nudge the covariance in the first iteration to prevent singularity
+  if (gamma_curr == 1) {
+    sig_new <- sig_new + abs(diag(rnorm(length(x_curr))))
+  }
+  
+  scale_new <- exp(log(p_curr[['scale']]) + gamma_curr * (min(1, exp(p_curr[['loga']])) - optimal_a))
+  
+  return(list(mu = mu_new,
+              sigma = sig_new,
+              scale = scale_new,
+              grad_log_pi = p_curr[['grad_log_pi']]))
+}
+```
+
+```{r}
+fin_diff_logistic <- function(beta,
+                              X,
+                              Y,
+                              prior_variance,
+                              step){
+  # A function to approximate grad_log_pi_logistic_cpp using the method of finite differences
+  ret <- vector(length = length(beta))
+  
+  for (i in 1:length(beta)) {
+    positive_perturbation <- beta
+    negative_perturbation <- beta
+    
+    positive_perturbation[i] <- positive_perturbation[i] + step
+    negative_perturbation[i] <- negative_perturbation[i] - step
+    
+    ret[i] <- (logpi_logistic_cpp(positive_perturbation,
+                                 as.matrix(X),
+                                 Y,
+                                 prior_variance) - logpi_logistic_cpp(negative_perturbation,
+                                                                      as.matrix(X),
+                                                                      Y,
+                                                                      prior_variance)) / (2 * step)
+  }
+  return(ret)
+}
+```
+
+```{r}
+gamma <- function(current,
+                  iteration) {
+  # if (iteration < 50000) {
+  #   return(0.001)
+  # } else {
+  #   return(iteration ^ (-0.6))
+  # }
+  return(iteration ^ (-0.6))
+  # return(0.001)
+}
+```
+
+```{r}
+outer_prod <- function(x, y) {
+  out <- matrix(nrow = length(x), ncol = length(y))
+  for (i in 1:length(x)) {
+    for (j in 1:length(y)) {
+      out[i, j] <- x[i] * y[j]
+    }
+  }
+  
+  return(out)
+}
+```
+
+```{r}
+esjd <- function(x_store) {
+  n <- nrow(x_store)
+  esjd_matrix <- (1 / (n - 1)) * (x_store[2:n, ] - x_store[1:(n - 1), ]) ^ 2
+  # vector to store componentwise ESJD
+  ret_vec <- vector(length = ncol(x_store))
+  ret_vec <- colMeans(esjd_matrix)
+  return(ret_vec)
+}
+```
+
+# Logistic Regression on Arrhythmia dataset
+
+```{r}
+###### import data
+aryt.uci <- read.csv(url("https://archive.ics.uci.edu/ml/machine-learning-databases/arrhythmia/arrhythmia.data"),
+                     header=FALSE)
+
+### DATA PREPROCESSING ########
+y<-as.numeric(aryt.uci[,280]==1)
+X<-aryt.uci[,-280]
+## Remove columns with missing values (denoted as "?") or identical terms
+cols.to.remove<-c()
+for(j in 1:dim(aryt.uci)[2]){
+  if(any(aryt.uci[,j]=="?")){
+    cols.to.remove<-c(cols.to.remove,j)
+  }else{
+    if(sd(aryt.uci[,j])==0){
+      cols.to.remove<-c(cols.to.remove,j)
+    }
+  }
+}
+X<-aryt.uci[,-c(cols.to.remove,280)]
+
+# import and select the correct columns (columns are imported because the sample.int function is unstable
+# across R versions)
+load(file = "cols.RData")
+X <- X[, cols]
+
+n<-dim(X)[1]
+p<-dim(X)[2]
+
+# # rescale if necessary
+X <- scale(X)
+prior_variance <- 25 # choose prior variance
+```
+
+# Arrhythmia - RWM
+
+```{r}
+init <- list(X = rep(1, p),
+             params = list(mu = rep(0, p),
+                           sigma =  diag(p),
+                           scale = (2.4 ^ 2) / p),
+             gamma = gamma)
+
+sample <- "AM_GAS_sample"
+update <- "AM_GAS_update"
+logpi <- logpi_logistic_cpp
+logpi_args <- list(X = X,
+                   Y = y,
+                   prior_variance = prior_variance)
+seed <- 200 
+learn_in <- 0
+nits <- 60000
+gamma <- gamma
+optimal_a <- 0.234
+
+AM_GAS_logistic_non_diag_scaled <- adapt(init = init,
+                                        sample = sample,
+                                        update = update,
+                                        logpi = logpi,
+                                        logpi_args = logpi_args,
+                                        learn_in = learn_in,
+                                        nits = nits,
+                                        gamma = gamma,
+                                        seed = seed,
+                                        optimal_a = optimal_a)
+
+plot(y = AM_GAS_logistic_non_diag_scaled$lambdas, x = 1:60000, type = "l")
+```
+
+# Arryhthmia - Barker
+
+```{r}
+# define the logpi args first, since we need them to compute the grad_log
+logpi_args <- list(X = X,
+                   Y = y,
+                   prior_variance = prior_variance)
+
+grad_log_pi <- grad_log_pi_logistic_cpp(x = rep(1, p),
+                                        X = as.matrix(X),
+                                        Y = y,
+                                        prior_variance = prior_variance)
+
+init <- list(X = rep(1, p),
+             params = list(mu = rep(0, p),
+                           sigma =  diag(p),
+                           scale = (2.4 ^ 2) / (p ^ (1 / 3)),
+                           grad_log_pi = grad_log_pi),
+             gamma = gamma)
+
+sample <- "AM_GAS_Barker_sample"
+update <- "AM_GAS_Barker_update"
+logpi <- logpi_logistic_cpp
+
+seed <- 200
+learn_in <- 0
+nits <- 60000
+gamma <- gamma
+optimal_a <- 0.574
+
+Barker_logistic_non_diag_scaled <- adapt(init = init,
+                         sample = sample,
+                         update = update,
+                         logpi = logpi,
+                         logpi_args = logpi_args,
+                         learn_in = learn_in,
+                         nits = nits,
+                         gamma = gamma,
+                         seed = seed,
+                         optimal_a = optimal_a)
+plot(y = Barker_logistic_non_diag_scaled$scales, x = 1:60000, type = "l")
+```
+
+# Arryhthmia - MALA
+
+```{r}
+logpi_args <- list(X = X,
+                   Y = y,
+                   prior_variance = prior_variance)
+
+grad_log_pi <- grad_log_pi_logistic_cpp(x = rep(1, p),
+                                        X = as.matrix(X),
+                                        Y = y,
+                                        prior_variance = prior_variance)
+
+init <- list(X = rep(1, p),
+             params = list(mu = rep(0, p),
+                           sigma =  diag(p),
+                           scale = (2.4 ^ 2) / (p ^ (1 / 3)),
+                           grad_log_pi = grad_log_pi),
+             gamma = gamma)
+
+sample <- "AM_GAS_MALA_sample"
+update <- "AM_GAS_MALA_update"
+logpi <- logpi_logistic_cpp
+
+seed <- 200
+learn_in <- 0
+nits <- 60000
+gamma <- gamma
+optimal_a <- 0.574
+
+MALA_logistic_non_diag_scaled <- adapt(init = init,
+                       sample = sample,
+                       update = update,
+                       logpi = logpi,
+                       logpi_args = logpi_args,
+                       learn_in = learn_in,
+                       nits = nits,
+                       gamma = gamma,
+                       seed = seed,
+                       optimal_a = optimal_a)
+plot(y = MALA_logistic_non_diag_scaled$scales, x = 1:60000, type = "l")
+```
+
+```{r, fig.height = 5, fig.width = 10}
+# Plotting
+
+# plots of the global scales
+nits <- 60000
+df_RWM_scale <- data.frame(iteration = 1:nits, global_scale = AM_GAS_logistic_non_diag_scaled$lambdas)
+df_Barker_scale <- data.frame(iteration = 1:nits, global_scale = Barker_logistic_non_diag_scaled$scales)
+df_MALA_scale <- data.frame(iteration = 1:nits, global_scale = MALA_logistic_non_diag_scaled$scales)
+
+ylim_scale <- c(1e-5, 10)
+
+RWM_scale_plot <- ggplot(df_RWM_scale, aes(x = iteration, y = global_scale)) +
+  geom_line() +
+  scale_y_continuous(limits = ylim_scale, trans = 'log10') + 
+  ggtitle("RWM")
+Barker_scale_plot <- ggplot(df_Barker_scale, aes(x = iteration, y = global_scale)) +
+  geom_line() +
+  scale_y_continuous(limits = ylim_scale, trans = 'log10') + 
+  ggtitle("Barker")
+MALA_scale_plot <- ggplot(df_MALA_scale, aes(x = iteration, y = global_scale)) +
+  geom_line() +
+  scale_y_continuous(limits = ylim_scale, trans = 'log10') + 
+  ggtitle("MALA")
+
+elements <- c(1, 2, 3, 4, 5, 45, 46, 47, 48, 49, 50)
+
+RWM_diag_plot <- diag_grob(AM_GAS_logistic_non_diag_scaled,
+                           ylim = c(1e-16, 1e6),
+                           ylog = TRUE,
+                           elements = elements)
+Barker_diag_plot <- diag_grob(Barker_logistic_non_diag_scaled,
+                              ylim = c(1e-16, 1e6),
+                              ylog = TRUE,
+                           elements = elements)
+MALA_diag_plot <- diag_grob(MALA_logistic_non_diag_scaled,
+                            ylim = c(1e-16, 1e6),
+                            ylog = TRUE,
+                           elements = elements)
+
+RWM_trace_plot <- trace_grob(AM_GAS_logistic_non_diag_scaled,
+                             ylim = c(-16, 15),
+                             ylog = FALSE,
+                           elements = elements)
+Barker_trace_plot <- trace_grob(Barker_logistic_non_diag_scaled,
+                                ylim = c(-16, 15),
+                                ylog = FALSE,
+                           elements = elements)
+MALA_trace_plot <- trace_grob(MALA_logistic_non_diag_scaled,
+                              ylim = c(-16, 15),
+                              ylog = FALSE,
+                           elements = elements)
+
+grid.arrange(RWM_scale_plot,
+             MALA_scale_plot,
+             Barker_scale_plot,
+             RWM_diag_plot,
+             MALA_diag_plot,
+             Barker_diag_plot,
+             RWM_trace_plot,
+             MALA_trace_plot,
+             Barker_trace_plot,
+             nrow = 3,
+             ncol = 3)
+```
+
+```{r, fig.height = 2.5, fig.width = 10}
+# Histograms
+df_Barker_11 <- data.frame(value = Barker_logistic_non_diag_unscaled$x_store[30000:60000, 11])
+hist_Barker_11 <- ggplot(df_Barker_11, aes(x = value)) + 
+  geom_histogram(aes(y=..density..), colour="black", fill="white")+
+  geom_density(alpha=.2, fill="#FF6666")
+
+df_Barker_4 <- data.frame(value = Barker_logistic_non_diag_unscaled$x_store[30000:60000, 4])
+hist_Barker_4 <- ggplot(df_Barker_4, aes(x = value)) + 
+  geom_histogram(aes(y=..density..), colour="black", fill="white")+
+  geom_density(alpha=.2, fill="#FF6666")
+
+df_Barker_37 <- data.frame(value = Barker_logistic_non_diag_unscaled$x_store[30000:60000, 37])
+hist_Barker_37 <- ggplot(df_Barker_37, aes(x = value)) + 
+  geom_histogram(aes(y=..density..), colour="black", fill="white")+
+  geom_density(alpha=.2, fill="#FF6666")
+
+grid.arrange(hist_Barker_4,
+             hist_Barker_37,
+             hist_Barker_11,
+             nrow = 1,
+             ncol = 3)
+```
+
+```{r}
+# ESS + ESJD calculations:
+# ESS_RWM <- effectiveSize(x = mcmc(AM_GAS_logistic_non_diag_unscaled$x_store))
+# min(ESS_RWM)
+# median(ESS_RWM)
+# ESS_MALA <- effectiveSize(x = mcmc(MALA_logistic_non_diag_unscaled$x_store))
+# min(ESS_MALA)
+# median(ESS_MALA)
+ESS_Barker <- effectiveSize(x = mcmc(Barker_logistic_non_diag_scaled$x_store[30000:60000, ]))
+min(ESS_Barker)
+median(ESS_Barker)
+ESJD_Barker <- esjd(Barker_logistic_non_diag_scaled$x_store[30000:60000, ])
+min(ESJD_Barker)
+median(ESJD_Barker) 
+```
+
+
+```{r}
+diag_grob <- function(fit, ylog = TRUE, ylim, elements, skewness = FALSE, skew, alpha = 1) {
+  # outputs a grob depicting the evolution of the diagonal elements of 
+  # a covariance matrix as it undergoes adaptation
+  # fit: the output object of the adapt function
+  # ylog: whether to plot the y axis as log_10
+  # ylim: the limits of the y axis
+  # elements: the dimensions of the distribution to plot the diagonal elements
+  #           of the covariances of (lol)
+  # skewness: a boolean indicating whether dimensions should be identified as skewed or not
+  # skew: a vector containing the dimensions which are skewed
+  # alpha: adjust the transparency
+  
+  # initialise an empty df
+  if (skewness) {
+    df <- data.frame(matrix(ncol = 3,
+                          nrow = 0,
+                          dimnames = list(NULL, c("iteration", "local_scale", "skewness"))))
+  } else {
+    df <- data.frame(matrix(ncol = 3,
+                          nrow = 0,
+                          dimnames = list(NULL, c("iteration", "local_scale", "dimension"))))
+  }
+  
+  d <- ncol(fit$x_store)
+  nits <- nrow(fit$x_store)
+  
+  if (missing(elements)) {
+    elements <- 1:d
+  }
+  
+  for (j in elements) {
+    mask <- vector(length = d)
+    mask[j] <- TRUE
+    if (skewness) {
+      if (j %in% skew) {
+        df_temp <- data.frame(iteration = 1:nits,
+                          local_scale = fit$sigmas[mask, j],
+                          skewness = "True")
+      } else {
+        df_temp <- data.frame(iteration = 1:nits,
+                          local_scale = fit$sigmas[mask, j],
+                          skewness = "False")
+      }
+    } else {
+      df_temp <- data.frame(iteration = 1:nits,
+                          local_scale = fit$sigmas[mask, j],
+                          dimension = toString(j))
+    }
+    df <- rbind(df, df_temp)
+  }
+  if (skewness) {
+    if (ylog) {
+      if (!missing(ylim)) {
+        output_grob <- ggplot(df, aes(x = iteration, y = local_scale, colour = skewness)) +
+          geom_line(alpha = alpha) +
+          scale_y_continuous(trans = 'log10', limits = ylim) +
+          theme(legend.position = "none") +
+          aes(group=rev(skewness))
+      } else {
+        output_grob <- ggplot(df, aes(x = iteration, y = local_scale, colour = skewness)) +
+          geom_line(alpha = alpha) +
+          scale_y_continuous(trans = 'log10') +
+          theme(legend.position = "none") +
+          aes(group=rev(skewness))
+      }
+    } else {
+      if (!missing(ylim)) {
+        output_grob <- ggplot(df, aes(x = iteration, y = local_scale, colour = skewness)) +
+          geom_line(alpha = alpha) +
+          theme(legend.position = "none") +
+          ylim(ylim) +
+          aes(group=rev(skewness))
+      } else {
+        output_grob <- ggplot(df, aes(x = iteration, y = local_scale, colour = skewness)) +
+          geom_line(alpha = alpha) +
+          theme(legend.position = "none") +
+          aes(group=rev(skewness))
+      }
+    }
+  } else {
+    if (ylog) {
+      if (!missing(ylim)) {
+        output_grob <- ggplot(df, aes(x = iteration, y = local_scale, colour = dimension)) +
+          geom_line(alpha = alpha) +
+          scale_y_continuous(trans = 'log10', limits = ylim) +
+          theme(legend.position = "none") +
+          aes(group=rev(dimension))
+      } else {
+        output_grob <- ggplot(df, aes(x = iteration, y = local_scale, colour = dimension)) +
+          geom_line(alpha = alpha) +
+          scale_y_continuous(trans = 'log10') +
+          theme(legend.position = "none") +
+          aes(group=rev(dimension))
+      }
+    } else {
+      if (!missing(ylim)) {
+        output_grob <- ggplot(df, aes(x = iteration, y = local_scale, colour = dimension)) +
+          geom_line(alpha = alpha) +
+          theme(legend.position = "none") +
+          ylim(ylim) +
+          aes(group=rev(dimension))
+      } else {
+        output_grob <- ggplot(df, aes(x = iteration, y = local_scale, colour = dimension)) +
+          geom_line(alpha = alpha) +
+          theme(legend.position = "none") +
+          aes(group=rev(dimension))
+      }
+    }
+  }
+  return(output_grob)
+}
+```
+
+```{r}
+trace_grob <- function(fit, ylog = FALSE, ylim, elements, skewness = FALSE, skew, alpha = 1) {
+  # outputs a grob of the trace of each dimension of the chain
+  # fit: an output object of the adapt function
+  # ylog: whether the y axis should be plotted on a log scale
+  # ylim: the limits of the y axis
+  # elements: the dimensions of the chain to plot the traces of
+  # skewness: a boolean indicating whether dimensions should be identified as skewed or not
+  # skew: a vector containing the dimensions which are skewed
+  # alpha: adjust the transparency
+  
+  # initialise an empty df
+  if (skewness) {
+    df <- data.frame(matrix(ncol = 3,
+                          nrow = 0,
+                          dimnames = list(NULL, c("iteration", "value", "skewness"))))
+  } else {
+    df <- data.frame(matrix(ncol = 3,
+                          nrow = 0,
+                          dimnames = list(NULL, c("iteration", "value", "dimension"))))
+  }
+  d <- ncol(fit$x_store)
+  nits <- nrow(fit$x_store)
+  
+  if (missing(elements)) {
+    elements <- 1:d
+  }
+  
+  for (j in elements) {
+    mask <- vector(length = d)
+    mask[j] <- TRUE
+    if (skewness) {
+      if (j %in% skew) {
+        df_temp <- data.frame(iteration = 1:nits,
+                          value = fit$x_store[, j],
+                          skewness = "True")
+      } else {
+        df_temp <- data.frame(iteration = 1:nits,
+                          value = fit$x_store[, j],
+                          skewness = "False")
+      }
+    } else {
+      df_temp <- data.frame(iteration = 1:nits,
+                          value = fit$x_store[, j],
+                          dimension = toString(j))
+    }
+    
+    df <- rbind(df, df_temp)
+  }
+  
+  if (skewness) {
+    if (ylog && !missing(ylim)) {
+      output_grob <- ggplot(df, aes(x = iteration, y = value, colour = skewness)) +
+        geom_line(alpha = alpha) +
+        theme(legend.position = "none") +
+        scale_y_continuous(trans = pseudolog10_trans, limits = ylim) +
+          aes(group=rev(skewness))
+    } else if (ylog && missing(ylim)) {
+      output_grob <- ggplot(df, aes(x = iteration, y = value, colour = skewness)) +
+        geom_line(alpha = alpha) +
+        theme(legend.position = "none") +
+        scale_y_continuous(trans = pseudolog10_trans) +
+          aes(group=rev(skewness))
+    } else if (!ylog && !missing(ylim)) {
+      output_grob <- ggplot(df, aes(x = iteration, y = value, colour = skewness)) +
+        geom_line(alpha = alpha) +
+        theme(legend.position = "none") +
+        ylim(ylim) +
+          aes(group=rev(skewness))
+    } else {
+      output_grob <- ggplot(df, aes(x = iteration, y = value, colour = skewness)) +
+        geom_line(alpha = alpha) +
+        theme(legend.position = "none") +
+          aes(group=rev(skewness))
+    }
+  } else {
+    if (ylog && !missing(ylim)) {
+      output_grob <- ggplot(df, aes(x = iteration, y = value, colour = dimension)) +
+        geom_line(alpha = alpha) +
+        theme(legend.position = "none") +
+        scale_y_continuous(trans = pseudolog10_trans, limits = ylim) +
+          aes(group=rev(dimension))
+    } else if (ylog && missing(ylim)) {
+      output_grob <- ggplot(df, aes(x = iteration, y = value, colour = dimension)) +
+        geom_line(alpha = alpha) +
+        theme(legend.position = "none") +
+        scale_y_continuous(trans = pseudolog10_trans) +
+          aes(group=rev(dimension))
+    } else if (!ylog && !missing(ylim)) {
+      output_grob <- ggplot(df, aes(x = iteration, y = value, colour = dimension)) +
+        geom_line(alpha = alpha) +
+        theme(legend.position = "none") +
+        ylim(ylim) +
+          aes(group=rev(dimension))
+    } else {
+      output_grob <- ggplot(df, aes(x = iteration, y = value, colour = dimension)) +
+        geom_line(alpha = alpha) +
+        theme(legend.position = "none") +
+          aes(group=rev(dimension))
+    }
+  }
+  return(output_grob)
+}
+```
+
+```{r}
+log_post_grob <- function(fit, prior_variance, X, Y) {
+  # A function which outputs the grob of a plot of the log posterior of the logistic model
+  # over time
+  
+  df <- data.frame(matrix(ncol = 2,
+                          nrow = 0,
+                          dimnames = list(NULL, c("iteration", "value"))))
+  for (i in 1:nrow(fit$x_store)) {
+    log_post <- logpi_logistic_cpp(beta = fit$x_store[i, ], X = X, Y = Y, prior_variance = prior_variance)
+    temp_df <- data.frame(iteration = i, value = log_post)
+    
+    df <- rbind(df, temp_df)
+  }
+  output_grob <- ggplot(df, aes(x = iteration, y = value)) +
+    geom_line() +
+    theme(legend.position = "none")
+  
+  return(output_grob)
+}
+```
